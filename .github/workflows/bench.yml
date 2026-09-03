@@ -1,0 +1,102 @@
+# Замер пропускной способности Omnilingual CTC 1B на x86 и ARM одновременно.
+# Положить в публичный репозиторий как .github/workflows/bench.yml и запустить вручную.
+#
+# Бесплатно: ARM64-раннеры бесплатны для публичных репозиториев с августа 2025.
+# Аудио синтетическое — никаких записей клиентов в репозиторий не попадает.
+#
+# Что даёт: канало-часов в час на одно ядро для каждой архитектуры
+#           плюс флаги векторных расширений процессора.
+
+name: STT platform benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Что за железо
+        run: |
+          echo "::group::процессор"
+          uname -m
+          lscpu | grep -Ei 'model name|architecture|^cpu\(s\)|mhz|bogomips' || true
+          echo "--- расширения, важные для int8 ---"
+          lscpu | grep -oE 'avx512_vnni|avx512f|avx2|i8mm|asimddp|sve2|sve|bf16|neon|asimd' | sort -u | tr '\n' ' '
+          echo
+          nproc
+          free -g | head -2
+          echo "::endgroup::"
+
+      - name: Поставить зависимости
+        run: |
+          python3 -m venv .venv
+          ./.venv/bin/pip install -q --upgrade pip
+          ./.venv/bin/pip install -q sherpa-onnx numpy
+          ./.venv/bin/python -c "import sherpa_onnx; print('sherpa-onnx', sherpa_onnx.__version__)"
+
+      - name: Скачать модель
+        run: |
+          R=csukuangfj2/sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-v2-int8-2026-02-05
+          curl -sL -o model.onnx "https://huggingface.co/$R/resolve/main/model.int8.onnx"
+          curl -sL -o tokens.txt "https://huggingface.co/$R/resolve/main/tokens.txt"
+          ls -lh model.onnx tokens.txt
+
+      - name: Синтетическое аудио
+        run: |
+          ./.venv/bin/python - <<'PY'
+          import numpy as np
+          rng = np.random.default_rng(7)
+          n = 16000 * 25                      # отрезки по 25 с, как в проде
+          segs = []
+          for _ in range(20):                 # 500 с суммарно
+              w = rng.standard_normal(n).astype(np.float32)
+              b = np.convolve(w, np.ones(60, dtype=np.float32) / 60, mode='same')
+              env = (np.sin(np.linspace(0, 80 * np.pi, n)) * 0.5 + 0.5).astype(np.float32)
+              segs.append((b * env * 0.25).astype(np.float32))
+          np.save('segments.npy', np.stack(segs))
+          print('готово: 500 с аудио')
+          PY
+
+      - name: Замер
+        run: |
+          ./.venv/bin/python - <<'PY'
+          import time, json, os, numpy as np, sherpa_onnx
+          segs = np.load('segments.npy')
+          audio = segs.shape[0] * segs.shape[1] / 16000
+          rows, best = [], None
+          for T in (1, 2, 4):
+              if T > os.cpu_count():
+                  break
+              rec = sherpa_onnx.OfflineRecognizer.from_omnilingual_asr_ctc(
+                  model="model.onnx", tokens="tokens.txt", num_threads=T)
+              s = rec.create_stream(); s.accept_waveform(16000, segs[0]); rec.decode_stream(s)
+              t0 = time.time()
+              for seg in segs:
+                  st = rec.create_stream(); st.accept_waveform(16000, seg); rec.decode_stream(st)
+              wall = time.time() - t0
+              rtfx, per = audio / wall, audio / wall / T
+              rows.append(dict(threads=T, rtfx=round(rtfx, 2), per_core=round(per, 3), wall_s=round(wall, 1)))
+              print(f"потоков={T}  RTFx={rtfx:6.2f}x  на ядро={per:5.2f}x  ({wall:.1f} с)")
+              if best is None or per > best['per_core']:
+                  best = rows[-1]
+          print()
+          print(f"ЛУЧШЕЕ: {best['threads']} потоков, {best['per_core']} канало-часа в час на ядро")
+          print(f"бэкфилл 10 000 канало-часов = {10000/best['per_core']:,.0f} ядро-часов")
+          json.dump(dict(arch=os.uname().machine, rows=rows, best=best), open('result.json', 'w'), indent=1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.arch }}
+          path: result.json
