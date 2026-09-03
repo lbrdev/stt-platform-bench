@@ -75,7 +75,7 @@ jobs:
           segs = np.load('segments.npy')
           audio = segs.shape[0] * segs.shape[1] / 16000
           rows, best = [], None
-          for T in (1, 2, 4):
+          for T in (1, 2, 4, 8):
               if T > os.cpu_count():
                   break
               rec = sherpa_onnx.OfflineRecognizer.from_omnilingual_asr_ctc(
